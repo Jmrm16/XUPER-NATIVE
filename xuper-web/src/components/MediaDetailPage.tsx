@@ -461,13 +461,25 @@ export const MediaDetailPage: React.FC<MediaDetailPageProps> = ({
   const artworkUrl = currentItem.backdrop || currentItem.landscape || currentItem.poster;
   const posterUrl = currentItem.poster || currentItem.landscape || currentItem.backdrop;
 
-  // Filter similar titles (excluding current)
+  // Rank by shared genres, deduplicate and keep movies and series separate.
   const similarTitles = useMemo(() => {
-    return relatedItems.filter((item) => item.id !== media.id).slice(0, 12);
-  }, [relatedItems, media.id]);
+    const normalize = (value: string) => value.trim().toLocaleLowerCase();
+    const genres = new Set((currentItem.genres || []).map(normalize));
+    const seen = new Set([String(media.id), String(currentItem.id)]);
+    return relatedItems.filter((item) => {
+      const id = String(item.id);
+      const series = item.type === 'teleplay' || item.type === 'series' || item.category === 'serie';
+      if (!item.id || seen.has(id) || series !== isSeries) return false;
+      seen.add(id);
+      return true;
+    }).map((item) => ({ item, affinity: (item.genres || []).filter((genre) => genres.has(normalize(genre))).length }))
+      .filter(({ affinity }) => genres.size === 0 || affinity > 0)
+      .sort((a, b) => b.affinity - a.affinity || (parseFloat(b.item.score || '0') || 0) - (parseFloat(a.item.score || '0') || 0))
+      .slice(0, 12).map(({ item }) => item);
+  }, [relatedItems, media.id, currentItem, isSeries]);
 
   return (
-    <div className="min-h-screen bg-[#141414] text-white animate-in fade-in duration-300">
+    <div className="desktop-detail min-h-screen bg-[#141414] text-white animate-in fade-in duration-300">
       {/* ============================================================ */}
       {/* 1. TOP DEDICATED NAVIGATION BAR                              */}
       {/* ============================================================ */}
@@ -965,9 +977,10 @@ export const MediaDetailPage: React.FC<MediaDetailPageProps> = ({
             <h2 className="text-xl font-bold text-white">Más títulos similares</h2>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
               {similarTitles.map((item, idx) => (
-                <div
+                <button
+                  type="button"
                   key={item.id || idx}
-                  className="media-card group cursor-pointer"
+                  className="media-card group cursor-pointer text-left min-w-0 w-full focus-visible:outline-2 focus-visible:outline-white focus-visible:outline-offset-4"
                   onClick={() => onSelectMedia && onSelectMedia(item)}
                 >
                   <div className="media-card-art is-poster relative">
@@ -998,7 +1011,7 @@ export const MediaDetailPage: React.FC<MediaDetailPageProps> = ({
                     <span>{item.year && item.year !== '—' ? item.year : ''}</span>
                     <span>{item.kind || ''}</span>
                   </span>
-                </div>
+                </button>
               ))}
             </div>
           </section>

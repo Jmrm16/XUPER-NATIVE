@@ -1,3 +1,4 @@
+import { AppHeader } from './components/AppHeader';
 import React, { useEffect, useState, useMemo, useRef, useCallback, useDeferredValue, useTransition } from 'react';
 import {
   Search,
@@ -1364,72 +1365,7 @@ export const App: React.FC = () => {
       {/* ============================================================ */}
       {/* 1. DEDICATED FULL-PAGE DETAIL VIEW (IF TITLE SELECTED)       */}
       {/* ============================================================ */}
-      {selectedMedia ? (
-        <MediaDetailPage
-          key={selectedMedia.id}
-          media={selectedMedia}
-          relatedItems={currentCatalogList.length > 0 ? currentCatalogList : movies}
-          watchEntry={watchProgressMap[selectedMedia.id] || null}
-          episodeProgressMap={episodeProgressMap[selectedMedia.id]}
-          onBack={closeMediaDetail}
-          onSelectMedia={openMediaDetail}
-          onPlayMovie={(
-            url,
-            title,
-            subtitle,
-            subtitles,
-            audioLanguages,
-            contentId,
-            initialTime,
-            resolvedMedia
-          ) => {
-            setActivePlayback({
-              url,
-              title,
-              subtitle,
-              isLive: false,
-              initialTime,
-              subtitles,
-              audioLanguages,
-              contentId,
-              mediaItem: { ...(resolvedMedia || selectedMedia), id: selectedMedia.id },
-            });
-          }}
-          onPlayEpisode={(
-            url,
-            title,
-            subtitle,
-            subtitles,
-            audioLanguages,
-            contentId,
-            seriesId,
-            initialTime,
-            episodeMeta,
-            resolvedMedia
-          ) => {
-            setActivePlayback({
-              url,
-              title,
-              subtitle,
-              isLive: false,
-              initialTime,
-              subtitles,
-              audioLanguages,
-              contentId,
-              seriesId,
-              episodeMeta,
-              mediaItem: { ...(resolvedMedia || selectedMedia), id: selectedMedia.id },
-            });
-          }}
-          isFavorite={isMediaFav(selectedMedia.id)}
-          onToggleFavorite={(item) => toggleFavoriteMedia(undefined, item)}
-        />
-      ) : (
-        <>
-          {/* ============================================================ */}
-          {/* 2. AUTHENTIC MAICAOFLIX TOP HEADER BAR                       */}
-          {/* ============================================================ */}
-          <header
+          <AppHeader
             ref={headerRef}
             style={{ paddingTop: 'var(--sat, 0px)' }}
             className={`browse-header fixed left-0 top-0 z-40 flex w-full items-center transition-all duration-300 ${
@@ -1632,7 +1568,10 @@ export const App: React.FC = () => {
                   spellCheck={false}
                   maxLength={100}
                   value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onChange={(e) => {
+                    if (selectedMedia) closeMediaDetail();
+                    setSearchQuery(e.target.value);
+                  }}
                   tabIndex={isSearchOpen ? 0 : -1}
                 />
                 {!!searchQuery && (
@@ -1737,7 +1676,7 @@ export const App: React.FC = () => {
                     ? 'Señal Activa • Ultra HD'
                     : 'Señal Desconectada (Clic para verificar)'
                 }
-                className="flex items-center gap-1.5 px-2 py-1 rounded bg-black/40 border border-zinc-800 hover:border-zinc-700 transition-colors text-[11px] cursor-pointer"
+                className="header-status flex items-center gap-1.5 px-2 py-1 rounded bg-black/40 border border-zinc-800 hover:border-zinc-700 transition-colors text-[11px] cursor-pointer"
               >
                 <span
                   className={`w-2 h-2 rounded-full ${
@@ -1757,7 +1696,7 @@ export const App: React.FC = () => {
                     setAuthModalMode('login');
                     setIsAuthModalOpen(true);
                   }}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer shrink-0 shadow"
+                  className="header-login inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer shrink-0 shadow"
                 >
                   <LogIn className="w-3.5 h-3.5" />
                   <span className="hidden sm:inline">Iniciar sesión</span>
@@ -1873,7 +1812,73 @@ export const App: React.FC = () => {
                 )}
               </div>
             </div>
-          </header>
+          </AppHeader>
+      {selectedMedia ? (
+        <MediaDetailPage
+          key={selectedMedia.id}
+          media={selectedMedia}
+          relatedItems={[...currentCatalogList, ...movies, ...series]}
+          watchEntry={watchProgressMap[selectedMedia.id] || null}
+          episodeProgressMap={episodeProgressMap[selectedMedia.id]}
+          onBack={closeMediaDetail}
+          onSelectMedia={openMediaDetail}
+          onPlayMovie={(
+            url,
+            title,
+            subtitle,
+            subtitles,
+            audioLanguages,
+            contentId,
+            initialTime,
+            resolvedMedia
+          ) => {
+            setActivePlayback({
+              url,
+              title,
+              subtitle,
+              isLive: false,
+              initialTime,
+              subtitles,
+              audioLanguages,
+              contentId,
+              mediaItem: { ...(resolvedMedia || selectedMedia), id: selectedMedia.id },
+            });
+          }}
+          onPlayEpisode={(
+            url,
+            title,
+            subtitle,
+            subtitles,
+            audioLanguages,
+            contentId,
+            seriesId,
+            initialTime,
+            episodeMeta,
+            resolvedMedia
+          ) => {
+            setActivePlayback({
+              url,
+              title,
+              subtitle,
+              isLive: false,
+              initialTime,
+              subtitles,
+              audioLanguages,
+              contentId,
+              seriesId,
+              episodeMeta,
+              mediaItem: { ...(resolvedMedia || selectedMedia), id: selectedMedia.id },
+            });
+          }}
+          isFavorite={isMediaFav(selectedMedia.id)}
+          onToggleFavorite={(item) => toggleFavoriteMedia(undefined, item)}
+        />
+      ) : (
+        <>
+          {/* ============================================================ */}
+          {/* 2. AUTHENTIC MAICAOFLIX TOP HEADER BAR                       */}
+          {/* ============================================================ */}
+
 
           {/* ============================================================ */}
           {/* 3. MAIN CATALOG OR SEARCH VIEW                               */}
