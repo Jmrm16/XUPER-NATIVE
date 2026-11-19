@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import Hls from 'hls.js';
 import {
   Play,
@@ -18,6 +18,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Search,
 } from 'lucide-react';
 import { Channel, api } from '../services/api';
 
@@ -48,6 +49,7 @@ export const LiveTVInlinePlayer: React.FC<LiveTVInlinePlayerProps> = ({
   const [streamError, setStreamError] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isControlsVisible, setIsControlsVisible] = useState<boolean>(false);
+  const [channelDirectoryQuery, setChannelDirectoryQuery] = useState('');
   const controlsTimeoutRef = useRef<number | null>(null);
 
   const [isMuted, setIsMuted] = useState<boolean>(() => {
@@ -320,6 +322,24 @@ export const LiveTVInlinePlayer: React.FC<LiveTVInlinePlayerProps> = ({
       ? Math.min(100, Math.max(5, channel.epgProgress))
       : 50;
 
+  const directoryChannels = useMemo(() => {
+    const query = channelDirectoryQuery.trim().toLocaleLowerCase();
+    const isCurrent = (candidate: Channel) =>
+      Boolean(
+        (candidate.channelCode && candidate.channelCode === channel.channelCode) ||
+          (candidate.id && candidate.id === channel.id) ||
+          candidate.name === channel.name,
+      );
+
+    return channelsList
+      .filter((candidate) =>
+        !query || `${candidate.name} ${candidate.category || ''}`.toLocaleLowerCase().includes(query),
+      )
+      .slice()
+      .sort((a, b) => Number(isCurrent(b)) - Number(isCurrent(a)) || a.name.localeCompare(b.name))
+      .slice(0, 60);
+  }, [channel, channelDirectoryQuery, channelsList]);
+
   return (
     <section
       aria-label="Reproductor de Televisión en Vivo Integrado"
@@ -520,7 +540,7 @@ export const LiveTVInlinePlayer: React.FC<LiveTVInlinePlayerProps> = ({
           </div>
 
           {/* RIGHT SIDE: CHANNEL INFO & QUICK ZAPPING DASHBOARD */}
-          <div className="lg:col-span-5 xl:col-span-4 p-5 sm:p-6 flex flex-col justify-between bg-gradient-to-b from-[#18181b] via-[#121214] to-[#0c0c0e] border-t lg:border-t-0 lg:border-l border-zinc-800/80 space-y-4">
+          <div className="lg:col-span-5 xl:col-span-4 p-4 sm:p-5 flex flex-col bg-gradient-to-b from-[#18181b] via-[#121214] to-[#0c0c0e] border-t lg:border-t-0 lg:border-l border-zinc-800/80 space-y-4">
             {/* Channel Logo and Identity */}
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-3">
@@ -607,6 +627,66 @@ export const LiveTVInlinePlayer: React.FC<LiveTVInlinePlayerProps> = ({
               </div>
             </div>
 
+            <div className="border-t border-zinc-800/70 pt-3 space-y-2.5 min-h-0">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[10px] font-bold tracking-[0.12em] text-zinc-400 uppercase">
+                  Cambiar canal
+                </span>
+                <span className="text-[10px] text-zinc-600">{directoryChannels.length} disponibles</span>
+              </div>
+              <label className="relative block">
+                <span className="sr-only">Buscar canal en el sintonizador</span>
+                <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+                <input
+                  type="search"
+                  value={channelDirectoryQuery}
+                  onChange={(event) => setChannelDirectoryQuery(event.target.value)}
+                  placeholder="Buscar canal"
+                  className="h-8 w-full rounded-md border border-zinc-800 bg-black/35 pl-8 pr-2.5 text-xs text-white outline-none placeholder:text-zinc-600 focus:border-zinc-600"
+                />
+              </label>
+              <div className="max-h-36 overflow-y-auto pr-1 space-y-1 scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent">
+                {directoryChannels.map((candidate, index) => {
+                  const active =
+                    (candidate.channelCode && candidate.channelCode === channel.channelCode) ||
+                    (candidate.id && candidate.id === channel.id) ||
+                    candidate.name === channel.name;
+                  return (
+                    <button
+                      key={candidate.channelCode || candidate.id || `${candidate.name}-${index}`}
+                      type="button"
+                      onClick={() => onSelectChannel(candidate)}
+                      aria-current={active ? 'true' : undefined}
+                      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer ${
+                        active
+                          ? 'bg-red-600/20 text-white ring-1 ring-inset ring-red-500/40'
+                          : 'text-zinc-300 hover:bg-zinc-800/80 hover:text-white'
+                      }`}
+                    >
+                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${active ? 'bg-red-500 animate-pulse' : 'bg-zinc-700'}`} />
+                      {candidate.logo ? (
+                        <img
+                          src={candidate.logo}
+                          alt=""
+                          className="h-4 w-7 shrink-0 object-contain"
+                          onError={(event) => {
+                            (event.target as HTMLImageElement).style.display = 'none';
+                          }}
+                        />
+                      ) : (
+                        <Tv className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate text-[11px] font-medium">{candidate.name}</span>
+                      {active && <span className="text-[9px] font-bold text-red-400">AHORA</span>}
+                    </button>
+                  );
+                })}
+                {directoryChannels.length === 0 && (
+                  <p className="px-2 py-3 text-center text-[11px] text-zinc-500">No hay canales con ese nombre.</p>
+                )}
+              </div>
+            </div>
+
             {/* Quick Action Buttons */}
             <div className="space-y-2 pt-2 border-t border-zinc-800/70">
               {/* PRIMARY FULLSCREEN EXPAND BUTTON */}
@@ -644,7 +724,7 @@ export const LiveTVInlinePlayer: React.FC<LiveTVInlinePlayerProps> = ({
               </div>
 
               <p className="text-[11px] text-zinc-500 text-center pt-1">
-                Toca cualquier canal abajo para cambiar de sintonía en esta pantalla.
+                Usa la lista para cambiar de señal sin salir del reproductor.
               </p>
             </div>
           </div>
