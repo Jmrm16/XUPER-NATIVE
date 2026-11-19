@@ -1,0 +1,686 @@
+// Unified Production & Render Server for XUPER
+// Single-port architecture: serves both API and Video Media Proxy
+import http from "node:http";
+import https from "node:https";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const svcDir = path.resolve(__dirname, "webos", "services", "com.webosflux.xuptertv.fidelity.service");
+const distDir = path.resolve(__dirname, "xuper-web", "dist");
+const MIME_TYPES = {
+  ".html": "text/html;charset=utf-8",
+  ".js": "application/javascript;charset=utf-8",
+  ".mjs": "application/javascript;charset=utf-8",
+  ".css": "text/css;charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".json": "application/json;charset=utf-8",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
+};
+
+const magis = require(path.join(svcDir, "magis.js"));
+const proxy = require(path.join(svcDir, "proxy.js"));
+const dnsx = require(path.join(svcDir, "dnsx.js"));
+const netdiag = require(path.join(svcDir, "netdiag.js"));
+const epg = require(path.join(svcDir, "epg.js"));
+
+const PORT = Number(process.env.PORT || 8910);
+const SEED_INGEST_TOKEN = process.env.SEED_INGEST_TOKEN || "";
+const MAX_SEED_BODY_BYTES = 1024 * 1024;
+const PUBLIC_LIVE_M3U_URL = "https://iptv-org.github.io/iptv/index.m3u";
+const PUBLIC_M3U_CACHE_MS = 10 * 60 * 1000;
+const PUBLIC_M3U_MAX_BYTES = 3 * 1024 * 1024;
+let publicLiveM3uCache = { at: 0, channels: [], categories: [] };
+
+const m3uAttribute = (line, name) => {
+  const match = new RegExp(`${name}="([^"]*)"`, "i").exec(line);
+  return match ? match[1].trim() : "";
+};
+
+const safeHeaderValue = (value) => String(value || "").replace(/[\r\n]/g, "").trim().slice(0, 1024);
+
+const parsePublicM3u = (body) => {
+  const lines = body.split(/\r?\n/);
+  const channels = [];
+  let metadata = "";
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#EXTINF:")) { metadata = line; continue; }
+    if (line.startsWith("#") || !metadata || !/^https?:\/\//i.test(line)) continue;
+    const comma = metadata.lastIndexOf(",");
+    const title = (comma >= 0 ? metadata.slice(comma + 1) : "Canal en vivo").trim();
+    const userAgent = safeHeaderValue(m3uAttribute(metadata, "http-user-agent"));
+    const referer = safeHeaderValue(m3uAttribute(metadata, "http-referrer"));
+    const headers = {};
+    if (userAgent) headers["User-Agent"] = userAgent;
+    if (referer) headers.Referer = referer;
+    channels.push({
+      id: `public_m3u_${channels.length + 1}`,
+      channelCode: `public_m3u_${channels.length + 1}`,
+      name: title || "Canal en vivo",
+      logo: m3uAttribute(metadata, "tvg-logo"),
+      category: m3uAttribute(metadata, "group-title") || "TV en vivo",
+      streamUrl: line,
+      headers,
+    });
+    metadata = "";
+  }
+  return channels;
+};
+
+const publicLiveCategories = (channels) => {
+  const names = new Set();
+  for (const channel of channels) {
+    for (const name of String(channel.category || 'TV en vivo').split(';')) {
+      const cleanName = name.trim();
+      if (cleanName) names.add(cleanName);
+    }
+  }
+  return Array.from(names)
+    .sort((a, b) => a.localeCompare(b, 'es'))
+    .map((name) => ({ id: `public_category_${name}`, name }));
+};
+
+const getPublicLiveCatalog = (callback) => {
+  if (publicLiveM3uCache.channels.length && Date.now() - publicLiveM3uCache.at < PUBLIC_M3U_CACHE_MS) {
+    callback(null, publicLiveM3uCache);
+    return;
+  }
+  const request = https.get(PUBLIC_LIVE_M3U_URL, { headers: { "User-Agent": "XuperWeb/1.0" } }, (response) => {
+    if (response.statusCode !== 200) {
+      response.resume();
+      callback(new Error(`La lista pública respondió HTTP ${response.statusCode || 0}`));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    response.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > PUBLIC_M3U_MAX_BYTES) request.destroy(new Error("La lista pública excede el tamaño permitido"));
+      else chunks.push(chunk);
+    });
+    response.on("end", () => {
+      if (size > PUBLIC_M3U_MAX_BYTES) return;
+      const channels = parsePublicM3u(Buffer.concat(chunks).toString("utf8"));
+      if (!channels.length) return callback(new Error("La lista pública no contiene canales compatibles"));
+      publicLiveM3uCache = { at: Date.now(), channels, categories: publicLiveCategories(channels) };
+      callback(null, publicLiveM3uCache);
+    });
+  });
+  request.setTimeout(15000, () => request.destroy(new Error("Tiempo de espera agotado al descargar la lista pública")));
+  request.on("error", callback);
+};
+
+const isAuthorizedSeedRequest = (req) => {
+  const supplied = req.headers["x-seed-token"];
+  if (!SEED_INGEST_TOKEN || typeof supplied !== "string") return false;
+  const expected = Buffer.from(SEED_INGEST_TOKEN, "utf8");
+  const received = Buffer.from(supplied, "utf8");
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
+};
+
+const json = (res, status, data) => {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {
+    "Content-Type": "application/json;charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Access-Control-Allow-Origin": "*",
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
+};
+
+const server = http.createServer((req, res) => {
+  // Determine public base URL dynamically from request headers
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  const host = req.headers.host || `127.0.0.1:${PORT}`;
+  const currentBaseUrl = process.env.PUBLIC_URL || `${proto}://${host}`;
+  proxy.setBaseUrl(currentBaseUrl);
+
+  const u = new URL(req.url, currentBaseUrl);
+
+  // Preflight CORS
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+      "Access-Control-Allow-Headers": "Content-Type, Range",
+    });
+    res.end();
+    return;
+  }
+
+  const requireSeedAdmin = () => {
+    if (!SEED_INGEST_TOKEN) {
+      json(res, 503, {
+        returnValue: false,
+        errorText: "SEED_INGEST_TOKEN is not configured",
+      });
+      return false;
+    }
+    if (!isAuthorizedSeedRequest(req)) {
+      json(res, 401, { returnValue: false, errorText: "Unauthorized seed operation" });
+      return false;
+    }
+    return true;
+  };
+
+  // Route Media Proxy on same port (/media/*, /hls/*, /sub/*)
+  if (
+    u.pathname.startsWith("/media/") ||
+    u.pathname.startsWith("/hls/") ||
+    u.pathname.startsWith("/sub/")
+  ) {
+    return proxy.handler(req, res);
+  }
+
+  const done = (err, data) => {
+    if (err) {
+      if (
+        (err.portalCode === "aaa100028" ||
+          err.portalCode === "aaa100027" ||
+          /未登录|sesi[oó]n|login|token/i.test(err.message || "")) &&
+        magis.resetSession
+      ) {
+        console.warn("[server] Session dead detected in response. Resetting session...");
+        magis.resetSession();
+        magis.ensureSession(() => {});
+      }
+      if (
+        (err.portalCode === "portal100024" ||
+          /bloqueo|semilla/i.test(err.message || "")) &&
+        magis.resetSeeds
+      ) {
+        console.warn("[server] Region block or seed exhaustion detected. Auto-resetting seeds pool...");
+        magis.resetSeeds();
+      }
+      return json(res, 502, {
+        returnValue: false,
+        errorText: String(err.message || err),
+        errorCode: err.portalCode || 1,
+      });
+    }
+    return json(res, 200, { returnValue: true, ...data });
+  };
+
+  // Health check & root status (when static dist/index.html is not present)
+  if ((u.pathname === "/" || u.pathname === "") && !fs.existsSync(path.join(distDir, "index.html"))) {
+    return json(res, 200, {
+      name: "Streaming Cloud API",
+      status: "online",
+      version: "1.1.0",
+      sessionReady: magis.session.ready,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  if (u.pathname === "/health" || u.pathname === "/ping") {
+    return json(res, 200, {
+      returnValue: true,
+      status: "ok",
+      port: PORT,
+      mode: "unified-single-port",
+    });
+  }
+
+  if (u.pathname === "/status") {
+    return json(res, 200, {
+      returnValue: true,
+      session: {
+        ready: magis.session.ready,
+        userId: magis.session.userId,
+        sn: magis.session.sn,
+        usesSeed: !!magis.session.usesSeed,
+      },
+      seeds: magis.seedStatus ? magis.seedStatus() : null,
+    });
+  }
+
+  // API Routes
+  if (u.pathname === "/home") {
+    const root = u.searchParams.get("root") || "movies";
+    const pageNum = parseInt(u.searchParams.get("page") || u.searchParams.get("pageNum") || "1", 10);
+    return magis.home(root, pageNum, done);
+  }
+
+  if (u.pathname === "/search") {
+    return magis.search(u.searchParams.get("value") || "", done);
+  }
+
+  if (u.pathname === "/detail") {
+    return magis.detail(u.searchParams.get("contentId") || u.searchParams.get("id") || "", done);
+  }
+
+  if (u.pathname === "/resolve") {
+    const contentId = u.searchParams.get("contentId") || u.searchParams.get("id") || "";
+    const seriesId = u.searchParams.get("seriesContentId") || u.searchParams.get("series") || "";
+    const trackIndex = u.searchParams.get("trackIndex") || u.searchParams.get("track");
+    const options = {};
+    if (trackIndex !== null && trackIndex !== undefined && trackIndex !== "") {
+      options.trackIndex = parseInt(trackIndex, 10);
+    }
+
+    let handleStream = (stream) => {
+      const isTs = stream.mime === "video/mp2t" || /\.ts(?:\?|$)/i.test(stream.url);
+      const token = proxy.add(stream.url, stream.headers, stream.duration, "", stream.backupUrls, false);
+      if (isTs) {
+        stream.proxyPath = `${currentBaseUrl}/media/${token}/stream.m3u8`;
+        stream.mime = "application/vnd.apple.mpegurl";
+        stream.isHls = true;
+      } else {
+        stream.proxyPath = `${currentBaseUrl}/media/${token}/stream.mp4`;
+      }
+
+      // Proxy and format subtitles (support WebVTT and SRT)
+      if (Array.isArray(stream.subtitles) && stream.subtitles.length > 0) {
+        const langNames = {
+          es: "Español",
+          spa: "Español",
+          esp: "Español",
+          "es-lat": "Español (Latino)",
+          "es-es": "Español (Castellano)",
+          en: "Inglés",
+          eng: "Inglés",
+          pt: "Portugués",
+          por: "Portugués",
+          fr: "Francés",
+          it: "Italiano",
+          de: "Alemán",
+        };
+        stream.subtitles = stream.subtitles.map((sub) => {
+          const subToken = proxy.addSubtitleToken(sub.url);
+          const langCode = (sub.lang || "es").toLowerCase();
+          const label = langNames[langCode] || (sub.lang ? sub.lang.toUpperCase() : "Subtítulo");
+          return {
+            lang: langCode,
+            label,
+            format: "vtt",
+            url: `${currentBaseUrl}/sub/${subToken}.vtt`,
+            srtUrl: `${currentBaseUrl}/sub/${subToken}.srt`,
+          };
+        });
+      } else {
+        stream.subtitles = [];
+      }
+
+      // Parse audio language tracks
+      if (typeof stream.audio === "string" && stream.audio.trim()) {
+        const parts = stream.audio.split(/[,\/|]/).map((s) => s.trim()).filter(Boolean);
+        const langMap = {
+          spa: "Español (Latino)",
+          es: "Español",
+          esp: "Español",
+          lat: "Español (Latino)",
+          latino: "Español (Latino)",
+          "es-lat": "Español (Latino)",
+          "es-es": "Español (Castellano)",
+          eng: "Inglés",
+          en: "Inglés",
+          ingles: "Inglés",
+          jpn: "Japonés",
+          ja: "Japonés",
+          jap: "Japonés",
+          japones: "Japonés",
+          por: "Portugués",
+          pt: "Portugués",
+          kor: "Coreano",
+          ko: "Coreano",
+          fra: "Francés",
+          fr: "Francés",
+          ita: "Italiano",
+          it: "Italiano",
+          deu: "Alemán",
+          de: "Alemán",
+          rus: "Ruso",
+          ru: "Ruso",
+          chi: "Chino",
+          zh: "Chino",
+        };
+        stream.audioLanguages = parts.map((code, idx) => ({
+          id: idx,
+          code: code.toLowerCase(),
+          name: langMap[code.toLowerCase()] || code.toUpperCase(),
+        }));
+      } else {
+        stream.audioLanguages = [];
+      }
+
+      safeDone(null, stream);
+    };
+
+    let hasResponded = false;
+    let timer = null;
+    const safeDone = (err, data) => {
+      if (!hasResponded) {
+        hasResponded = true;
+        if (timer) clearTimeout(timer);
+        done(err, data);
+      }
+    };
+
+    const tryResolve = (cId, sId, allowSwap) => {
+      magis.resolve(cId, sId, options, (err, stream) => {
+        if (err && allowSwap && sId && sId !== cId) {
+          console.log(`[resolve] Attempt with id=${cId}&series=${sId} failed. Retrying with swapped params id=${sId}&series=${cId}...`);
+          return tryResolve(sId, cId, false);
+        }
+        if (err) {
+          if (/未登录|sesi[oó]n|login|aaa100028/i.test(err.message || "")) {
+            if (magis.resetSession) magis.resetSession();
+          }
+          return safeDone(err);
+        }
+        return handleStream(stream);
+      });
+    };
+
+    timer = setTimeout(() => {
+      if (!hasResponded) {
+        console.warn(`[resolve] Timeout resolving id=${contentId}`);
+        safeDone(new Error("Timeout al resolver transmisión en el servidor"));
+      }
+    }, 14000);
+
+    return tryResolve(contentId, seriesId, true);
+  }
+
+  if (u.pathname === "/resetSeeds") {
+    if (!requireSeedAdmin()) return;
+    const available = magis.resetSeeds ? magis.resetSeeds() : 0;
+    return magis.ensureSession((err) => {
+      done(err, {
+        message: "Seed pool reset and refreshed",
+        availableSeeds: available,
+        status: magis.seedStatus ? magis.seedStatus() : null,
+      });
+    });
+  }
+
+  if (u.pathname === "/feedSeeds" && req.method === "POST") {
+    if (!requireSeedAdmin()) return;
+    const declaredLength = Number(req.headers["content-length"] || 0);
+    if (declaredLength > MAX_SEED_BODY_BYTES) {
+      return json(res, 413, { returnValue: false, errorText: "Seed payload too large" });
+    }
+    let body = "";
+    let bodyBytes = 0;
+    let payloadRejected = false;
+    req.on("data", (chunk) => {
+      if (payloadRejected) return;
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_SEED_BODY_BYTES) {
+        payloadRejected = true;
+        json(res, 413, { returnValue: false, errorText: "Seed payload too large" });
+        return;
+      }
+      body += chunk;
+    });
+    req.on("end", () => {
+      if (payloadRejected) return;
+      try {
+        const payload = JSON.parse(body);
+        const seeds = Array.isArray(payload) ? payload : (payload.seeds || []);
+        if (seeds && seeds.length && magis.storeSeeds) {
+          magis.storeSeeds(seeds);
+          if (magis.resetSession) magis.resetSession();
+          return magis.ensureSession((err) => {
+            done(err, { message: "Seeds fed successfully", added: seeds.length });
+          });
+        }
+        return done(new Error("No valid seeds array provided"));
+      } catch (err) {
+        return done(err);
+      }
+    });
+    return;
+  }
+
+  if (u.pathname === "/resetSession") {
+    if (!requireSeedAdmin()) return;
+    if (magis.resetSession) magis.resetSession();
+    return magis.ensureSession((err) => {
+      done(err, { message: "Session reset and initialized", session: magis.session });
+    });
+  }
+
+  if (u.pathname === "/publicLiveChannels" || u.pathname === "/publicMoviesChannels") {
+    return getPublicLiveCatalog((err, catalog) => {
+      const responseChannels = ((catalog && catalog.channels) || []).map(({ headers, ...channel }) => channel);
+      done(err, { channels: responseChannels, categories: (catalog && catalog.categories) || [] });
+    });
+  }
+
+  if (u.pathname === "/liveCategories") {
+    const fetchCats = (retry = true) => {
+      magis.getLiveCategories((err, categories) => {
+        if (err && retry && (/aaa100028|aaa100027|未登录/i.test(err.message || "") || err.portalCode === "aaa100028")) {
+          console.warn("[liveCategories] Session dead. Resetting session and retrying...");
+          if (magis.resetSession) magis.resetSession();
+          return magis.ensureSession(() => fetchCats(false));
+        }
+        done(err, { categories: categories || [] });
+      });
+    };
+    return fetchCats(true);
+  }
+
+  if (u.pathname === "/liveChannels") {
+    const colId = u.searchParams.get("columnId") || null;
+    const pageNum = parseInt(u.searchParams.get("pageNum") || "1", 10);
+    const pageSize = parseInt(u.searchParams.get("pageSize") || "250", 10);
+    const epgOpts = {
+      region: u.searchParams.get("region") || "auto",
+      offsetMinutes: parseInt(u.searchParams.get("offsetMin") || "0", 10) || 0,
+    };
+    const fetchChs = (retry = true) => {
+      magis.getLiveChannels(colId, pageNum, pageSize, (err, channels) => {
+        if (err && retry && (/aaa100028|aaa100027|未登录/i.test(err.message || "") || err.portalCode === "aaa100028")) {
+          console.warn("[liveChannels] Session dead. Resetting session and retrying...");
+          if (magis.resetSession) magis.resetSession();
+          return magis.ensureSession(() => fetchChs(false));
+        }
+        const enriched = (channels || []).map((ch) => {
+          const info = epg.getNowNext(ch.name, epgOpts);
+          if (!info.now && !info.next) return ch;
+          return {
+            ...ch,
+            epgTitle: info.now ? info.now.title : (info.next ? `Luego: ${info.next.title}` : ch.epgTitle),
+            epgNext: info.next ? info.next.title : undefined,
+            epgTime: info.now ? `${info.now.startTime} - ${info.now.stopTime}` : (info.next ? `${info.next.startTime} - ${info.next.stopTime}` : undefined),
+            epgProgress: info.now ? info.now.progress : undefined,
+          };
+        });
+        done(err, { channels: enriched });
+      });
+    };
+    return fetchChs(true);
+  }
+
+  if (u.pathname === "/liveEpg") {
+    if (req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => {
+        if (body.length < 256 * 1024) body += chunk.toString("utf8");
+      });
+      req.on("end", () => {
+        try {
+          const parsed = JSON.parse(body || "{}");
+          const names = Array.isArray(parsed.names) ? parsed.names : [];
+          const epgOpts = {
+            region: parsed.region || "auto",
+            offsetMinutes: parseInt(parsed.offsetMin || "0", 10) || 0,
+          };
+          return json(res, 200, { returnValue: true, epg: epg.getNowNextBatch(names, epgOpts), status: epg.getStatus() });
+        } catch {
+          return json(res, 400, { returnValue: false, errorText: "Invalid JSON" });
+        }
+      });
+      return;
+    }
+    const name = u.searchParams.get("name") || "";
+    const epgOpts = {
+      region: u.searchParams.get("region") || "auto",
+      offsetMinutes: parseInt(u.searchParams.get("offsetMin") || "0", 10) || 0,
+    };
+    const data = name ? epg.getSchedule(name, 8, epgOpts) : { now: null, next: null, schedule: [] };
+    return json(res, 200, { returnValue: true, ...data, status: epg.getStatus() });
+  }
+
+  if (u.pathname === "/resolveLive") {
+    const streamUrl = u.searchParams.get("streamUrl") || "";
+    const channelCode = u.searchParams.get("channelCode") || u.searchParams.get("id") || "";
+    if (channelCode.startsWith("public_m3u_")) {
+      return getPublicLiveCatalog((err, catalog) => {
+        if (err) return done(err);
+        const channel = ((catalog && catalog.channels) || []).find((item) => item.channelCode === channelCode);
+        if (!channel) return done(new Error("Canal público no encontrado o actualizado"));
+        const token = proxy.add(channel.streamUrl, channel.headers || {}, 0, null, null, true);
+        done(null, {
+          url: `${currentBaseUrl}/media/${token}/stream.m3u8`,
+          proxyPath: `${currentBaseUrl}/media/${token}/stream.m3u8`,
+          isHls: true,
+        });
+      });
+    }
+    if (streamUrl) {
+      const token = proxy.add(streamUrl, {}, 0, null, null, true);
+      return done(null, {
+        url: `${currentBaseUrl}/media/${token}/stream.m3u8`,
+        proxyPath: `${currentBaseUrl}/media/${token}/stream.m3u8`,
+        isHls: true,
+      });
+    }
+    const fetchResolve = (retry = true) => {
+      magis.resolveLive(channelCode, (err, stream) => {
+        if (err && retry && (/aaa100028|aaa100027|未登录/i.test(err.message || "") || err.portalCode === "aaa100028")) {
+          console.warn("[resolveLive] Session dead. Resetting session and retrying...");
+          if (magis.resetSession) magis.resetSession();
+          return magis.ensureSession(() => fetchResolve(false));
+        }
+        if (err) return done(err);
+        const token = proxy.add(stream.url, stream.headers, 0, null, stream.backupUrls, true);
+        stream.proxyPath = `${currentBaseUrl}/media/${token}/stream.m3u8`;
+        stream.isHls = true;
+        done(null, stream);
+      });
+    };
+    return fetchResolve(true);
+  }
+
+  // Static frontend serving (React/Tailwind/shadcn dist bundle)
+  if ((req.method === "GET" || req.method === "HEAD") && fs.existsSync(path.join(distDir, "index.html"))) {
+    let reqPath = "/";
+    try {
+      reqPath = decodeURIComponent(u.pathname || "/");
+    } catch {
+      reqPath = "/";
+    }
+    if (reqPath === "/" || reqPath === "") reqPath = "/index.html";
+    let filePath = path.resolve(distDir, "." + reqPath);
+    const inDist = filePath === distDir || filePath.startsWith(distDir + path.sep);
+    if (inDist && fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+      filePath = path.join(filePath, "index.html");
+    }
+    if (!inDist || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      if (req.method === "GET" && !path.extname(reqPath)) {
+        filePath = path.join(distDir, "index.html");
+      } else {
+        return json(res, 404, { returnValue: false, errorText: "not found" });
+      }
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] || "application/octet-stream";
+    const stat = fs.statSync(filePath);
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Content-Length": stat.size,
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=31536000",
+    });
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  json(res, 404, { returnValue: false, errorText: "not found" });
+});
+
+let seedSyncTimer = null;
+
+export function startLocalServer(port = PORT, host = "127.0.0.1") {
+  return new Promise((resolve, reject) => {
+    if (server.listening) {
+      const addr = server.address();
+      return resolve(typeof addr === "object" && addr ? addr.port : port);
+    }
+
+    const onBound = () => {
+      const addr = server.address();
+      const boundPort = typeof addr === "object" && addr ? addr.port : port;
+      console.log(`[Xuper Server] running on http://${host}:${boundPort}`);
+      epg.warmUp();
+      magis.ensureSession((err, sess) => {
+        if (err) {
+          console.warn(`[Xuper Server] Pre-warm session warning:`, err.message);
+        } else {
+          console.log(`[Xuper Server] Session active (ready: ${sess?.ready}, user: ${sess?.userId}, usingSeed: ${sess?.usesSeed})`);
+        }
+      });
+
+      if (!seedSyncTimer) {
+        seedSyncTimer = setInterval(() => {
+          if (magis.refreshSeeds) {
+            magis.refreshSeeds((err, updated) => {
+              if (!err && updated) {
+                console.log(`[Xuper Server] Background seed sync updated pool.`);
+              }
+            });
+          }
+        }, 5 * 60 * 1000);
+        if (typeof seedSyncTimer.unref === "function") seedSyncTimer.unref();
+      }
+
+      resolve(boundPort);
+    };
+
+    const tryListen = (targetPort, allowFallback) => {
+      const onError = (err) => {
+        if (allowFallback && err && err.code === "EADDRINUSE" && targetPort !== 0) {
+          console.warn(`[Xuper Server] Port ${targetPort} in use, retrying on an ephemeral port...`);
+          tryListen(0, false);
+          return;
+        }
+        reject(err);
+      };
+      server.once("error", onError);
+      server.listen(targetPort, host, () => {
+        server.removeListener("error", onError);
+        onBound();
+      });
+    };
+
+    tryListen(port, port !== 0);
+  });
+}
+
+if (process.env.XUPER_AUTO_START !== "0") {
+  startLocalServer(PORT, process.env.HOST || "127.0.0.1").catch((err) => {
+    console.error("[Xuper Server] Fatal start error:", err);
+    process.exit(1);
+  });
+}

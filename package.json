@@ -1,0 +1,21 @@
+{
+  "name": "xuper-native",
+  "version": "1.0.0",
+  "description": "Xuper TV Standalone Desktop (.exe) & Android (.apk) App without remote backend",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "desktop": "electron .",
+    "build:web": "node scripts/build-android-runtime.mjs && npm --prefix xuper-web run build",
+    "build:exe": "npm run build:web && npx @electron/packager . XuperTV --platform=win32 --arch=x64 --out=dist-exe --overwrite --ignore=\"^/(android|dist-apk|dist-exe|xuper-rn|xuper-web/node_modules|xuper-web/src)\"",
+    "build:apk": "powershell -NoProfile -Command \"cd xuper-rn/android; ./gradlew.bat --init-script mirror-init.gradle :app:assembleRelease --no-daemon; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cd ../..; mkdir -Force dist-apk | Out-Null; copy -Force xuper-rn/android/app/build/outputs/apk/release/app-release.apk dist-apk/XuperTV.apk\""
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.3.2"
+  }
+}

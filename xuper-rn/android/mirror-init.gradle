@@ -1,0 +1,71 @@
+def rewriteRepos = { RepositoryHandler repos ->
+    def toRemove = []
+    repos.each { ArtifactRepository repo ->
+        if (repo instanceof MavenArtifactRepository) {
+            def u = repo.url.toString()
+            if (u.contains('repo.maven.apache.org') || u.contains('repo1.maven.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/public')
+            } else if (u.contains('plugins.gradle.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/gradle-plugin')
+            }
+        }
+    }
+    repos.maven { url = uri('https://maven.aliyun.com/repository/public') }
+    repos.maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+    repos.google()
+}
+
+gradle.beforeSettings { settings ->
+    settings.pluginManagement {
+        repositories {
+            maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+            maven { url = uri('https://maven.aliyun.com/repository/public') }
+            google()
+        }
+    }
+    settings.dependencyResolutionManagement {
+        repositories {
+            maven { url = uri('https://maven.aliyun.com/repository/public') }
+            maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+            google()
+        }
+    }
+}
+
+gradle.settingsEvaluated { settings ->
+    rewriteRepos(settings.pluginManagement.repositories)
+    rewriteRepos(settings.dependencyResolutionManagement.repositories)
+}
+
+gradle.beforeProject { project ->
+    project.buildscript.repositories.all { ArtifactRepository repo ->
+        if (repo instanceof MavenArtifactRepository) {
+            def u = repo.url.toString()
+            if (u.contains('repo.maven.apache.org') || u.contains('repo1.maven.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/public')
+            } else if (u.contains('plugins.gradle.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/gradle-plugin')
+            }
+        }
+    }
+    project.repositories.all { ArtifactRepository repo ->
+        if (repo instanceof MavenArtifactRepository) {
+            def u = repo.url.toString()
+            if (u.contains('repo.maven.apache.org') || u.contains('repo1.maven.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/public')
+            } else if (u.contains('plugins.gradle.org')) {
+                repo.url = uri('https://maven.aliyun.com/repository/gradle-plugin')
+            }
+        }
+    }
+    project.buildscript.repositories {
+        maven { url = uri('https://maven.aliyun.com/repository/public') }
+        maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+        google()
+    }
+    project.repositories {
+        maven { url = uri('https://maven.aliyun.com/repository/public') }
+        maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+        google()
+    }
+}

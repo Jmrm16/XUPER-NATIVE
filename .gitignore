@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Generated desktop and mobile packages
+dist-exe/
+dist-apk/
+out/
+release/
+*.exe
+*.apk
+*.zip
+
+# Build output
+xuper-web/dist/
+xuper-web/.firebase/
+xuper-rn/android/.gradle/
+xuper-rn/android/app/build/
+android/.gradle/
+android/sdk-build/
+**/local.properties
+**/*.keystore
+**/*.jks
+**/*.class
+**/*.dex
+**/seeds-fallback.json
+*.tsbuildinfo
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+.firebase/
+.firebaserc
+firebase-debug.log
+*-debug.log
+npm-debug.log*
+*.log
+
+# Operating-system files
+.DS_Store
+Thumbs.db
